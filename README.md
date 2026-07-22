@@ -25,3 +25,5 @@ git push -u origin change-x     # Vercel comments a preview URL on the PR
 `sw.js` is network-first for same-origin requests, so a new deploy shows up on
 the next load — no stale app. The mp4box CDN (used only for large-file audio
 extraction) is never cached and always loaded fresh.
+
+<!-- deploy pipeline test 16:36:26 -->
