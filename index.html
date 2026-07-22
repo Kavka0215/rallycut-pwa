@@ -872,7 +872,9 @@ async function beginAnalysis(session){
     if(session.mode==="file"){
       hits = await detectHits(session.file).catch(()=>null);
       if(hits===null){
-        session.warnings.push("No usable audio track — using simulated detection. Accuracy may drop.");
+        const why = _lastAudioFail ? (" (" + _lastAudioFail + ")") : "";
+        console.error("[RallyCut] audio detection failed" + why);
+        session.warnings.push("No usable audio track — using simulated detection. Accuracy may drop." + why);
         hits = simulateHits(session.duration);
       } else if(!hits.peaks.length){
         session.warnings.push("No clear ball-strike sounds found — results may be incomplete.");
@@ -954,8 +956,10 @@ function peaksFromPCM(ch, sr){
   return {peaks, strongSnr};
 }
 
+let _lastAudioFail = null; // human-readable reason the audio path failed (for UI/log)
 async function detectHits(file){
   let ch=null, sr=16000;
+  _lastAudioFail = null;
   // Large containers (multi-hundred-MB .mov/.mp4) overflow whole-file
   // decodeAudioData — it must buffer + decode the ENTIRE file, video track
   // included, and throws EncodingError. So for big files we demux ONLY the
@@ -964,7 +968,10 @@ async function detectHits(file){
   const STREAM_MIN = 60*1024*1024; // 60 MB
   if(file.size >= STREAM_MIN){
     try{ const r = await extractAudioPCM(file); ch=r.ch; sr=r.sr; }
-    catch(e){ console.warn('streaming audio extract failed, falling back:', e); ch=null; }
+    catch(e){
+      _lastAudioFail = 'stream-extract: ' + (e && e.message ? e.message : e);
+      console.warn('streaming audio extract failed, falling back:', e); ch=null;
+    }
   }
   if(!ch){
     // Fallback: whole-file decode. Works for small files and for browsers
@@ -977,7 +984,10 @@ async function detectHits(file){
       const buf = await file.arrayBuffer();
       const audio = await ctx.decodeAudioData(buf);
       sr = audio.sampleRate; ch = audio.getChannelData(0);
-    }catch(e){ ctx.close(); return null; }
+    }catch(e){
+      if(!_lastAudioFail) _lastAudioFail = 'whole-file-decode: ' + (e && e.message ? e.message : e);
+      ctx.close(); return null;
+    }
     ctx.close();
   }
   return peaksFromPCM(ch, sr);
@@ -1036,6 +1046,31 @@ function synthAACConfig(sampleRate, channels){
 function fullAudioCodec(codec){
   return (codec && codec.indexOf('.')>=0) ? codec : 'mp4a.40.2';
 }
+// Configure the decoder, trying the container's own AudioSpecificConfig first,
+// then a synthesized AAC-LC config, then no description. Different files/OSes
+// bury (or omit) the config differently; configure() throws synchronously on a
+// structurally-invalid config, so we fall through to the next candidate.
+// Returns the codec string used, or throws with a descriptive message.
+function tryConfigureAudio(decoder, track, mp4){
+  const codec = fullAudioCodec(track.codec);
+  const base = { codec,
+    sampleRate: track.audio.sample_rate,
+    numberOfChannels: track.audio.channel_count };
+  const fromBox = audioTrackDescription(mp4, track.id);
+  const synth   = synthAACConfig(track.audio.sample_rate, track.audio.channel_count);
+  const isAAC   = codec.indexOf('mp4a') === 0;
+  const cands = [];
+  if(fromBox) cands.push({ ...base, description: fromBox });
+  cands.push({ ...base, description: synth });
+  if(!isAAC) cands.push({ ...base }); // non-AAC (e.g. Opus/FLAC) may need no description
+  let lastErr = null;
+  for(const cfg of cands){
+    try{ decoder.configure(cfg); return codec; }
+    catch(e){ lastErr = e; }
+  }
+  throw new Error('unsupported audio "'+track.codec+'" @'+track.audio.sample_rate
+    +'Hz/'+track.audio.channel_count+'ch: '+(lastErr && lastErr.message ? lastErr.message : lastErr));
+}
 
 async function extractAudioPCM(file){
   if(!('AudioDecoder' in window)) throw new Error('WebCodecs AudioDecoder unavailable');
@@ -1043,35 +1078,39 @@ async function extractAudioPCM(file){
   const mp4 = MP4Box.createFile();
 
   const {parts, sr} = await new Promise((resolve,reject)=>{
-    let track=null, decoder=null, pcmParts=[], outSR=0, decErr=null, flushed=false;
+    let track=null, decoder=null, pcmParts=[], outSR=0, decErr=null;
+    let flushed=false, seen=0;
+
+    const finish = ()=>{
+      if(flushed) return; flushed = true;
+      decoder.flush()
+        .then(()=>{ decErr ? reject(decErr) : resolve({parts:pcmParts, sr:outSR||track.audio.sample_rate}); })
+        .catch(reject);
+    };
 
     mp4.onError = e=>reject(new Error('demux error: '+e));
     mp4.onReady = info=>{
-      track = info.audioTracks && info.audioTracks[0];
-      if(!track){ reject(new Error('no audio track in container')); return; }
-      decoder = new AudioDecoder({
-        output: ad=>{
-          outSR = ad.sampleRate;
-          const bytes = ad.allocationSize({planeIndex:0, format:'f32-planar'});
-          const tmp = new Float32Array(bytes/4);
-          ad.copyTo(tmp, {planeIndex:0, format:'f32-planar'}); // channel 0 only
-          pcmParts.push(tmp);
-          ad.close();
-        },
-        error: e=>{ decErr=e; }
-      });
-      const desc = audioTrackDescription(mp4, track.id)
-                 || synthAACConfig(track.audio.sample_rate, track.audio.channel_count);
-      decoder.configure({
-        codec: fullAudioCodec(track.codec),
-        sampleRate: track.audio.sample_rate,
-        numberOfChannels: track.audio.channel_count,
-        description: desc
-      });
-      mp4.setExtractionOptions(track.id, null, {nbSamples: 1000});
-      mp4.start();
+      try{
+        track = info.audioTracks && info.audioTracks[0];
+        if(!track || !track.audio){ reject(new Error('no decodable audio track in container')); return; }
+        decoder = new AudioDecoder({
+          output: ad=>{
+            outSR = ad.sampleRate;
+            const bytes = ad.allocationSize({planeIndex:0, format:'f32-planar'});
+            const tmp = new Float32Array(bytes/4);
+            ad.copyTo(tmp, {planeIndex:0, format:'f32-planar'}); // channel 0 only
+            pcmParts.push(tmp);
+            ad.close();
+          },
+          error: e=>{ decErr = e; }
+        });
+        tryConfigureAudio(decoder, track, mp4); // throws with a clear reason if unsupported
+        mp4.setExtractionOptions(track.id, null, {nbSamples: 1000});
+        mp4.start();
+      }catch(e){ reject(e); }
     };
     mp4.onSamples = (id, user, samples)=>{
+      if(decErr){ reject(decErr); return; }
       for(const s of samples){
         decoder.decode(new EncodedAudioChunk({
           type: s.is_sync ? 'key' : 'delta',
@@ -1080,24 +1119,43 @@ async function extractAudioPCM(file){
           data: s.data
         }));
       }
+      seen += samples.length;
       const last = samples[samples.length-1];
-      if(!flushed && last && last.number >= track.nb_samples-1){
-        flushed = true;
-        decoder.flush()
-          .then(()=>{ decErr ? reject(decErr) : resolve({parts:pcmParts, sr:outSR||track.audio.sample_rate}); })
-          .catch(reject);
-      }
+      // Primary completion: reached the last known sample.
+      if(!flushed && last && track.nb_samples && last.number >= track.nb_samples-1) finish();
     };
 
-    // Feed the file to mp4box in 16 MB slices (never one giant arrayBuffer).
+    // Feed the file to mp4box in 16 MB slices (never one giant arrayBuffer),
+    // applying decode backpressure so a 10-min track can't flood the WebCodecs
+    // queue and OOM the tab on mobile.
     (async()=>{
       const CHUNK = 16*1024*1024;
       for(let pos=0; pos<file.size; pos+=CHUNK){
         const ab = await file.slice(pos, Math.min(pos+CHUNK, file.size)).arrayBuffer();
         ab.fileStart = pos;
         mp4.appendBuffer(ab);
+        // Drain the decoder if it falls behind (only meaningful once onReady
+        // has fired — i.e. for moov-at-front streams).
+        let guard = 0;
+        while(decoder && decoder.decodeQueueSize > 256 && guard++ < 4000){
+          await new Promise(r=>setTimeout(r, 15));
+        }
       }
       mp4.flush();
+      // Safety net: some containers (edit lists, fragmented, mis-counted
+      // nb_samples) never let the per-batch check fire. Once the whole file is
+      // fed and the decode queue has drained, finish anyway so we NEVER silently
+      // fall back to simulated data on a file that actually decoded fine.
+      (async()=>{
+        let guard = 0;
+        while(!flushed && decoder && decoder.decodeQueueSize > 0 && guard++ < 4000){
+          await new Promise(r=>setTimeout(r, 15));
+        }
+        if(!flushed && decoder){
+          if(seen > 0) finish();
+          else reject(new Error('demuxed no audio samples (track present but empty)'));
+        }
+      })();
     })().catch(reject);
   });
 
